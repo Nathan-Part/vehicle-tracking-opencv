@@ -1,241 +1,461 @@
-import cv2
-import sys
-import math
+"""Vehicle detection and tracking with classic computer vision (OpenCV only).
+
+Pipeline per frame:
+    blur -> MOG2 background subtraction -> drop shadows -> morphology
+    -> contours + filters -> merge nearby boxes -> centroid tracking
+    -> closest moment per car -> annotated video + JSON report
+
+Usage:
+    python app.py                       # cars.mp4 next to this file, with preview
+    python app.py --input my_video.mp4  # another video
+    python app.py --no-display          # headless (servers, CI), as fast as possible
+    python app.py --help
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
+import math
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
-# ── Configuration ──────────────────────────────────────────────
-VIDEO_PATH = r"c:\Users\natou\Desktop\ITC-2\cars.mp4"
+import cv2
 
-# ── Open the video file ───────────────────────────────────────
-cap = cv2.VideoCapture(VIDEO_PATH)
+BASE_DIR = Path(__file__).resolve().parent
 
-if not cap.isOpened():
-    print(f"[ERROR] Cannot open video: {VIDEO_PATH}")
-    sys.exit(1)
+# ── Tuning ───────────────────────────────────────────────────────────────────
+# Pixel values below were tuned on a 1080p video. Detection runs on a copy of
+# each frame resized so that min(width, height) == REF_SIZE, so the same values
+# work for 480p, 720p or 4K, and boxes are mapped back to the real size.
+REF_SIZE = 1080
 
-# ── Read and print video metadata ─────────────────────────────
-width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps          = cap.get(cv2.CAP_PROP_FPS)
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+BLUR_SIZE = 11             # Gaussian blur kernel (odd)
+MOG2_HISTORY = 700
+MOG2_VAR_THRESHOLD = 120
+SHADOW_THRESHOLD = 200     # MOG2 marks shadows ~127, foreground 255
 
-print(f"Video loaded  : {VIDEO_PATH}")
-print(f"Resolution    : {width} x {height}")
-print(f"FPS           : {fps:.2f}")
-print(f"Total frames  : {total_frames}")
+KERNEL_SMALL = 5           # opening: removes small noise dots
+KERNEL_BIG = 15            # dilate/erode: merges fragments of the same car
 
-# ── Background subtractor ─────────────────────────────────────
-# detectShadows=True → shadows become gray (~127) so we can filter them out
-back_sub = cv2.createBackgroundSubtractorMOG2(
-    history=700, varThreshold=120, detectShadows=True)
+MIN_CONTOUR_AREA = 6000    # px²
+MIN_BOX_W = 40             # px
+MIN_BOX_H = 130            # px
+MIN_ASPECT, MAX_ASPECT = 0.3, 4.0
+MERGE_GAP = 100            # merge boxes closer than this (px)
 
-# ── Detection tuning ──────────────────────────────────────────
-MIN_CONTOUR_AREA = 6000   # ignore contours smaller than this (pixels)
+# If more than this share of the frame is "moving", it's a global change
+# (lighting flash, camera shake, MOG2 warm-up), not cars: skip detection.
+MAX_FOREGROUND_RATIO = 0.5
 
-# ── Step 4: Tracking setup ────────────────────────────────────
-# Each tracked object: {id: (cx, cy, frames_unseen, frames_seen)}
-tracked_objects = {}    # objects from the PREVIOUS frame
-next_id = 1             # counter for assigning new IDs
-MAX_DISTANCE = 350      # max pixels between frames to consider it the same car
-MAX_UNSEEN = 8          # keep an object in memory for this many frames if not detected
-MIN_HITS = 3            # object must be seen this many frames before we draw it
+MAX_DISTANCE = 350         # max centroid jump between frames (px at 1080p)
+MAX_UNSEEN = 8             # frames a lost car is kept in memory
+MIN_HITS = 3               # detections needed before a car is confirmed
+VELOCITY_SMOOTHING = 0.5   # 0 = ignore motion, 1 = trust last displacement only
 
-# ── Step 5: Closest moment tracking ──────────────────────────
-# For each ID, store its biggest bounding box (= closest to camera)
-closest_moment = {}
+FALLBACK_FPS = 30.0
 
-# ── Calculate delay between frames (milliseconds) ─────────────
-delay = int(1000 / fps) if fps > 0 else 30   # fallback to ~33 ms
 
-# ── Step 6: Video writer (saves annotated video to output.mp4) ──
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out_path = r"c:\Users\natou\Desktop\ITC-2\output.mp4"
-writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+def working_scale(width: int, height: int) -> float:
+    """Factor from the video size to the working (reference) size."""
+    return REF_SIZE / min(width, height)
 
-# ── Playback loop ─────────────────────────────────────────────
-frame_index = 0
 
-while True:
-    ret, frame = cap.read()          # read the next frame
-    if not ret:
-        print("End of video (or read error).")
-        break
-
-    # ── 1) Blur the frame to reduce camera noise BEFORE detection ──
-    blurred = cv2.GaussianBlur(frame, (11, 11), 0)
-
-    # ── 2) Background subtraction ──────────────────────────────
-    fg_mask = back_sub.apply(blurred)
-
-    # ── 3) Remove shadows (gray pixels) → keep only pure white ─
-    _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-    # ── 4) Morphological cleanup ───────────────────────────────
-    # Small kernel to remove tiny noise dots
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    # Big kernel to merge fragments of the same car into one blob
-    kernel_big = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-
-    # OPEN with small kernel → removes small noise dots
-    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_small, iterations=2)
-    # Dilate with big kernel → bridges gaps between fragments
-    fg_mask = cv2.dilate(fg_mask, kernel_big, iterations=3)
-    # Erode back so the box isn't too bloated
-    fg_mask = cv2.erode(fg_mask, kernel_big, iterations=2)
-
-    # ── 5) Find contours and collect valid detections ───────────
-    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-
-    # Build a list of valid bounding boxes: [(x, y, w, h), ...]
-    boxes = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < MIN_CONTOUR_AREA:
-            continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        # Filter: must be wide and tall enough to be a car
-        if w < 40 or h < 130:
-            continue
-        aspect = w / float(h)
-        if aspect < 0.3 or aspect > 4.0:
-            continue
-        boxes.append([x, y, x + w, y + h])   # store as [x1, y1, x2, y2]
-
-    # ── Merge overlapping or nearby boxes (so one car = one box) ─
-    MERGE_GAP = 100  # merge boxes within 100px of each other
+# ── Detection ────────────────────────────────────────────────────────────────
+def merge_boxes(boxes: list[list[int]], gap: float) -> list[list[int]]:
+    """Merge boxes [x1, y1, x2, y2] that overlap or are closer than `gap`."""
+    boxes = [list(b) for b in boxes]
     merged = True
     while merged:
         merged = False
-        new_boxes = []
-        while boxes:
-            box = boxes.pop(0)
-            found = False
-            for i, other in enumerate(new_boxes):
-                # Check if the two boxes overlap OR are close
-                if box[0] <= other[2] + MERGE_GAP and box[2] >= other[0] - MERGE_GAP and \
-                   box[1] <= other[3] + MERGE_GAP and box[3] >= other[1] - MERGE_GAP:
-                    # Merge: take the bounding box of both
-                    new_boxes[i] = [min(box[0], other[0]), min(box[1], other[1]),
-                                    max(box[2], other[2]), max(box[3], other[3])]
-                    found = True
+        result: list[list[int]] = []
+        for box in boxes:
+            for i, other in enumerate(result):
+                if (box[0] <= other[2] + gap and box[2] >= other[0] - gap and
+                        box[1] <= other[3] + gap and box[3] >= other[1] - gap):
+                    result[i] = [min(box[0], other[0]), min(box[1], other[1]),
+                                 max(box[2], other[2]), max(box[3], other[3])]
                     merged = True
                     break
-            if not found:
-                new_boxes.append(box)
-        boxes = new_boxes
+            else:
+                result.append(box)
+        boxes = result
+    return boxes
 
-    # Convert merged boxes to detections: [(cx, cy, x, y, w, h), ...]
-    detections = []
-    for (x1, y1, x2, y2) in boxes:
-        w, h = x2 - x1, y2 - y1
-        cx = x1 + w // 2
-        cy = y1 + h // 2
-        detections.append((cx, cy, x1, y1, w, h))
 
-    # ── 6) Simple tracking: match detections to previous objects ─
-    new_tracked = {}           # will replace tracked_objects at end of frame
-    used_ids = set()           # IDs already matched this frame
+class Detector:
+    """Turns raw frames into car bounding boxes (x, y, w, h)."""
 
-    for (cx, cy, x, y, w, h) in detections:
-        best_id = None
-        best_dist = MAX_DISTANCE  # only match if closer than this
+    def __init__(self, width: int, height: int):
+        self.width, self.height = width, height
+        self.scale = working_scale(width, height)
+        self.work_size = (round(width * self.scale), round(height * self.scale))
+        self.back_sub = cv2.createBackgroundSubtractorMOG2(
+            history=MOG2_HISTORY, varThreshold=MOG2_VAR_THRESHOLD,
+            detectShadows=True)
+        self.k_small = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (KERNEL_SMALL, KERNEL_SMALL))
+        self.k_big = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (KERNEL_BIG, KERNEL_BIG))
+        self.mask = None       # last cleaned mask, at working size
+        self.skipped = False   # True when the last frame was a global change
 
-        # Compare this detection's center to every known object
-        for obj_id, (ox, oy, _, seen) in tracked_objects.items():
-            dist = math.hypot(cx - ox, cy - oy)  # Euclidean distance
-            if dist < best_dist and obj_id not in used_ids:
-                best_dist = dist
-                best_id = obj_id
+    def detect(self, frame) -> list[tuple[int, int, int, int]]:
+        """Returns car boxes (x, y, w, h) in the frame's own coordinates."""
+        if self.scale != 1.0:
+            interp = cv2.INTER_AREA if self.scale < 1 else cv2.INTER_LINEAR
+            frame = cv2.resize(frame, self.work_size, interpolation=interp)
+        blurred = cv2.GaussianBlur(frame, (BLUR_SIZE, BLUR_SIZE), 0)
+        fg = self.back_sub.apply(blurred)
+        _, fg = cv2.threshold(fg, SHADOW_THRESHOLD, 255, cv2.THRESH_BINARY)
 
-        # Count how many times this object has been seen
-        if best_id is not None:
-            prev_seen = tracked_objects[best_id][3]
-        else:
-            prev_seen = 0
-            best_id = next_id
-            next_id += 1
+        self.skipped = cv2.countNonZero(fg) > MAX_FOREGROUND_RATIO * fg.size
+        if self.skipped:
+            self.mask = fg
+            return []
 
-        hits = prev_seen + 1
-        used_ids.add(best_id)
-        new_tracked[best_id] = (cx, cy, 0, hits)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self.k_small, iterations=2)
+        fg = cv2.dilate(fg, self.k_big, iterations=3)
+        fg = cv2.erode(fg, self.k_big, iterations=2)
+        self.mask = fg
 
-        # Only draw if object has been seen for MIN_HITS frames (filters flicker)
-        if hits >= MIN_HITS:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID {best_id}", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < MIN_CONTOUR_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w < MIN_BOX_W or h < MIN_BOX_H:
+                continue
+            if not MIN_ASPECT <= w / float(h) <= MAX_ASPECT:
+                continue
+            boxes.append([x, y, x + w, y + h])
 
-            # ── Step 5: Track closest moment (biggest box = closest) ─
-            area = w * h
-            if best_id not in closest_moment or area > closest_moment[best_id]["area"]:
-                closest_moment[best_id] = {
-                    "area": area,
-                    "frame": frame_index,
-                    "bbox": (x, y, w, h)
-                }
+        s = self.scale
+        result = []
+        for x1, y1, x2, y2 in merge_boxes(boxes, MERGE_GAP):
+            x1, y1 = round(x1 / s), round(y1 / s)
+            x2, y2 = min(self.width, round(x2 / s)), min(self.height, round(y2 / s))
+            result.append((x1, y1, x2 - x1, y2 - y1))
+        return result
 
-    # Keep unmatched objects in memory for a few frames (grace period)
-    for obj_id, (ox, oy, unseen, seen) in tracked_objects.items():
-        if obj_id not in used_ids and unseen < MAX_UNSEEN:
-            new_tracked[obj_id] = (ox, oy, unseen + 1, seen)
 
-    # Update tracked objects for the next frame
-    tracked_objects = new_tracked
+# ── Tracking ─────────────────────────────────────────────────────────────────
+@dataclass
+class Track:
+    cx: float
+    cy: float
+    vx: float = 0.0
+    vy: float = 0.0
+    hits: int = 1
+    unseen: int = 0
+    car_id: int | None = None   # public ID, given once the track is confirmed
 
-    # Overlay frame counter + FPS on the frame
-    text = f"Frame: {frame_index}  |  FPS: {fps:.1f}"
-    cv2.putText(frame, text, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    def predicted(self) -> tuple[float, float]:
+        steps = self.unseen + 1
+        return self.cx + self.vx * steps, self.cy + self.vy * steps
 
-    cv2.imshow("Mask", fg_mask)       # debug: see the cleaned mask
-    cv2.imshow("Video", frame)       # display the frame with boxes
 
-    # Step 6: Write annotated frame to output video
-    writer.write(frame)
+class CentroidTracker:
+    """Nearest-centroid tracker with motion prediction and global matching.
 
-    frame_index += 1
+    - Every (detection, track) pair is ranked by distance to the track
+      (predicted or last seen position, whichever is closer), and the
+      closest pairs are matched first, so the result doesn't depend on the
+      order of detections.
+    - A track becomes a car (and gets a public ID) after `min_hits`
+      detections, so public IDs are 1, 2, 3... with no gaps from flicker.
+    """
 
-    # Press 'q' to quit early
-    if cv2.waitKey(delay) & 0xFF == ord('q'):
-        print("Playback stopped by user.")
-        break
+    def __init__(self, max_distance: float, max_unseen: int = MAX_UNSEEN,
+                 min_hits: int = MIN_HITS):
+        self.max_distance = max_distance
+        self.max_unseen = max_unseen
+        self.min_hits = min_hits
+        self.tracks: dict[int, Track] = {}
+        self._next_track = 1
+        self._next_car = 1
 
-# ── Cleanup ───────────────────────────────────────────────────
-cap.release()
-writer.release()
-cv2.destroyAllWindows()
+    def update(self, boxes):
+        """Returns [(car_id, (x, y, w, h)), ...] for confirmed cars seen now."""
+        centers = [(x + w / 2, y + h / 2) for x, y, w, h in boxes]
 
-# ── Step 5: Print summary of closest moments ─────────────────
-print("\n" + "=" * 60)
-print("CLOSEST MOMENT PER CAR (largest bounding box)")
-print("=" * 60)
-print(f"{'ID':>5}  {'Frame':>6}  {'Time (s)':>9}  {'BBox (x,y,w,h)'}")
-print("-" * 60)
-for car_id in sorted(closest_moment.keys()):
-    info = closest_moment[car_id]
-    f = info["frame"]
-    t = f / fps if fps > 0 else 0
-    bx, by, bw, bh = info["bbox"]
-    print(f"{car_id:>5}  {f:>6}  {t:>8.2f}s  ({bx}, {by}, {bw}, {bh})")
-print("=" * 60)
+        pairs = []
+        for d, (cx, cy) in enumerate(centers):
+            for tid, t in self.tracks.items():
+                # Closest of the predicted and the last seen position: the
+                # prediction helps fast cars, the last position keeps working
+                # when the motion estimate is off (car leaving, slowing down)
+                px, py = t.predicted()
+                dist = min(math.hypot(cx - px, cy - py),
+                           math.hypot(cx - t.cx, cy - t.cy))
+                if dist < self.max_distance:
+                    pairs.append((dist, d, tid))
+        pairs.sort()
 
-# ── Step 6: Export results to JSON ───────────────────────────
-results = []
-for car_id in sorted(closest_moment.keys()):
-    info = closest_moment[car_id]
-    f = info["frame"]
-    bx, by, bw, bh = info["bbox"]
-    results.append({
-        "id": int(car_id),
-        "closest_frame": int(f),
-        "closest_time_sec": round(f / fps, 2) if fps > 0 else 0,
-        "bbox": [int(bx), int(by), int(bw), int(bh)],
-        "area": int(info["area"])
-    })
+        matched_det: dict[int, int] = {}
+        used_tracks: set[int] = set()
+        for _, d, tid in pairs:
+            if d in matched_det or tid in used_tracks:
+                continue
+            matched_det[d] = tid
+            used_tracks.add(tid)
 
-json_path = r"c:\Users\natou\Desktop\ITC-2\results.json"
-with open(json_path, "w") as jf:
-    json.dump(results, jf, indent=2)
+        confirmed = []
+        for d, (cx, cy) in enumerate(centers):
+            tid = matched_det.get(d)
+            if tid is None:
+                tid = self._next_track
+                self._next_track += 1
+                t = self.tracks[tid] = Track(cx, cy)
+                used_tracks.add(tid)
+            else:
+                t = self.tracks[tid]
+                steps = t.unseen + 1
+                a = VELOCITY_SMOOTHING
+                t.vx = (1 - a) * t.vx + a * (cx - t.cx) / steps
+                t.vy = (1 - a) * t.vy + a * (cy - t.cy) / steps
+                t.cx, t.cy = cx, cy
+                t.hits += 1
+                t.unseen = 0
+            if t.hits >= self.min_hits:
+                if t.car_id is None:
+                    t.car_id = self._next_car
+                    self._next_car += 1
+                confirmed.append((t.car_id, boxes[d]))
 
-print(f"\nSaved results to {json_path}")
-print(f"Saved annotated video to {out_path}")
+        # Tracks not seen this frame age, and are dropped after max_unseen
+        for tid in list(self.tracks):
+            if tid in used_tracks:
+                continue
+            t = self.tracks[tid]
+            t.unseen += 1
+            if t.unseen > self.max_unseen:
+                del self.tracks[tid]
+        return confirmed
+
+
+# ── Per-car statistics ───────────────────────────────────────────────────────
+@dataclass
+class CarStats:
+    first_frame: int
+    first_cx: float
+    last_frame: int = 0
+    last_cx: float = 0.0
+    best_area: int = -1
+    best_frame: int = 0
+    best_bbox: tuple = field(default_factory=tuple)
+
+    def update(self, frame_index: int, bbox) -> None:
+        x, y, w, h = bbox
+        self.last_frame, self.last_cx = frame_index, x + w / 2
+        if w * h > self.best_area:
+            self.best_area, self.best_frame, self.best_bbox = w * h, frame_index, bbox
+
+
+def build_report(stats: dict[int, CarStats], fps: float) -> list[dict]:
+    report = []
+    for car_id in sorted(stats):
+        s = stats[car_id]
+        dx = s.last_cx - s.first_cx
+        report.append({
+            "id": int(car_id),
+            "closest_frame": int(s.best_frame),
+            "closest_time_sec": round(s.best_frame / fps, 2),
+            "bbox": [int(v) for v in s.best_bbox],
+            "area": int(s.best_area),
+            "first_seen_sec": round(s.first_frame / fps, 2),
+            "last_seen_sec": round(s.last_frame / fps, 2),
+            "direction": "right" if dx > 0 else "left" if dx < 0 else "unknown",
+        })
+    return report
+
+
+# ── Drawing ──────────────────────────────────────────────────────────────────
+def draw_car(frame, car_id: int, bbox) -> None:
+    x, y, w, h = bbox
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    label_y = y - 10 if y >= 30 else y + 25   # keep the label inside the frame
+    cv2.putText(frame, f"ID {car_id}", (x + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+
+def draw_hud(frame, frame_index: int, total: int, cars: int, proc_fps: float) -> None:
+    total_txt = f"/{total}" if total > 0 else ""
+    text = (f"Frame {frame_index}{total_txt}  |  Cars: {cars}  |  "
+            f"Processing: {proc_fps:.0f} fps")
+    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 0, 0), 4)
+    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 255, 0), 2)
+
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+def _window_closed(name: str) -> bool:
+    try:
+        return cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
+def process_video(input_path: Path, output_path: Path | None, json_path: Path | None,
+                  display: bool = True, verbose: bool = True) -> list[dict]:
+    """Runs the full pipeline and returns the JSON report (list of cars)."""
+    log = print if verbose else (lambda *a, **k: None)
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {input_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or math.isnan(fps) or fps <= 0 or fps > 1000:
+        log(f"[WARN] Invalid FPS ({fps}), using {FALLBACK_FPS}")
+        fps = FALLBACK_FPS
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError(f"Invalid video size {width}x{height}: {input_path}")
+
+    log(f"Video loaded  : {input_path}")
+    log(f"Resolution    : {width} x {height}")
+    log(f"FPS           : {fps:.2f}")
+    log(f"Total frames  : {total if total > 0 else 'unknown'}")
+
+    writer = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"Cannot create output video: {output_path}")
+
+    detector = Detector(width, height)
+    tracker = CentroidTracker(MAX_DISTANCE / detector.scale)
+    stats: dict[int, CarStats] = {}
+    frame_delay = 1.0 / fps
+    proc_fps = 0.0
+    frame_index = 0
+    skipped_frames = 0
+
+    try:
+        while True:
+            t0 = time.perf_counter()
+            ok, frame = cap.read()
+            if not ok:
+                log("End of video.")
+                break
+
+            boxes = detector.detect(frame)
+            skipped_frames += detector.skipped
+            for car_id, bbox in tracker.update(boxes):
+                draw_car(frame, car_id, bbox)
+                x, y, w, h = bbox
+                if car_id not in stats:
+                    stats[car_id] = CarStats(first_frame=frame_index,
+                                             first_cx=x + w / 2)
+                stats[car_id].update(frame_index, bbox)
+
+            draw_hud(frame, frame_index, total, len(stats), proc_fps)
+            if writer is not None:
+                writer.write(frame)
+
+            elapsed = max(time.perf_counter() - t0, 1e-6)
+            proc_fps = 0.9 * proc_fps + 0.1 * (1 / elapsed) if proc_fps else 1 / elapsed
+
+            if display:
+                try:
+                    mask = detector.mask
+                    if mask.shape[:2] != frame.shape[:2]:
+                        mask = cv2.resize(mask, (width, height),
+                                          interpolation=cv2.INTER_NEAREST)
+                    cv2.imshow("Mask", mask)
+                    cv2.imshow("Video", frame)
+                except cv2.error:
+                    log("[WARN] No GUI available (headless OpenCV?), "
+                        "continuing without preview")
+                    display = False
+                else:
+                    # Play at the video's real speed, minus processing time
+                    wait_ms = max(1, int((frame_delay - elapsed) * 1000))
+                    key = cv2.waitKey(wait_ms) & 0xFF
+                    if key in (ord("q"), 27) or _window_closed("Video"):
+                        log("Playback stopped by user.")
+                        break
+
+            frame_index += 1
+    except KeyboardInterrupt:
+        log("\nInterrupted, saving what was processed so far.")
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        if display:
+            cv2.destroyAllWindows()
+
+    report = build_report(stats, fps)
+
+    if skipped_frames:
+        log(f"Skipped {skipped_frames} frame(s) with a global change "
+            "(lighting, camera motion or background warm-up).")
+    log("\n" + "=" * 72)
+    log(f"CARS DETECTED: {len(report)}   (closest moment = largest bounding box)")
+    log("=" * 72)
+    log(f"{'ID':>4}  {'Seen (s)':>13}  {'Dir':>5}  {'Closest':>8}  {'BBox (x,y,w,h)'}")
+    log("-" * 72)
+    for car in report:
+        seen = f"{car['first_seen_sec']:.1f}-{car['last_seen_sec']:.1f}"
+        log(f"{car['id']:>4}  {seen:>13}  {car['direction']:>5}  "
+            f"{car['closest_time_sec']:>7.2f}s  {tuple(car['bbox'])}")
+    log("=" * 72)
+
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(report, jf, indent=2)
+        log(f"\nSaved results to {json_path}")
+    if output_path is not None:
+        log(f"Saved annotated video to {output_path}")
+    return report
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Detect and track cars in a fixed-camera video (OpenCV).")
+    p.add_argument("-i", "--input", type=Path, default=BASE_DIR / "cars.mp4",
+                   help="input video (default: cars.mp4 next to app.py)")
+    p.add_argument("-o", "--output", type=Path, default=BASE_DIR / "output.mp4",
+                   help="annotated output video (default: output.mp4)")
+    p.add_argument("-j", "--json", type=Path, default=BASE_DIR / "results.json",
+                   help="JSON report (default: results.json)")
+    p.add_argument("--no-video", action="store_true",
+                   help="don't write the annotated video")
+    p.add_argument("--no-display", action="store_true",
+                   help="no preview windows, process as fast as possible")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if not args.input.is_file():
+        print(f"[ERROR] Video not found: {args.input}", file=sys.stderr)
+        return 1
+    if not args.no_video and args.output.resolve() == args.input.resolve():
+        print("[ERROR] Output video would overwrite the input.", file=sys.stderr)
+        return 1
+    try:
+        process_video(args.input, None if args.no_video else args.output,
+                      args.json, display=not args.no_display)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
