@@ -41,12 +41,12 @@ Video Frame
 ┌──────────────────────┐
 │  4. Contour Detection │  findContours → bounding boxes
 │     + Filtering       │  Filter by area, size, aspect ratio
-│     + Box Merging     │  Merge nearby boxes (MERGE_GAP=100px)
+│     + Box Merging     │  Merge nearby boxes (200px across, 100px up/down)
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
-│  5. Centroid Tracking │  Global nearest-first matching against the
-│     (ID assignment)   │  predicted or last position of each car
+│  5. Tracking          │  Bottom-centre point, confirmed cars first,
+│     (ID assignment)   │  nearest-first; confirmed after 3 hits + 75px travel
 └──────────┬───────────┘
            ▼
 ┌──────────────────────┐
@@ -64,8 +64,9 @@ Video Frame
 | **Global change guard** | Skip the frame if > 50 % of the pixels are foreground | A lighting flash or camera jolt is not a car |
 | **Noise removal** | Morphological OPEN (erode→dilate) | Removes small noise dots without affecting large blobs |
 | **Fragment merging** | Morphological DILATE + ERODE | Bridges gaps between fragments of the same car |
-| **Box merging** | Iterative pairwise merge (MERGE_GAP=100px) | Simple to implement and explain; consolidates fragmented detections |
-| **Tracking** | Nearest-centroid, global nearest-first matching, constant-velocity prediction | Order-independent, follows fast cars, still beginner-friendly |
+| **Box merging** | Iterative pairwise merge, 200px horizontally / 100px vertically | One vehicle (even with a trailer) is long; lanes are stacked vertically |
+| **Tracking** | Bottom-centre point, confirmed-first then nearest-first matching, constant-velocity prediction | Stable point, order-independent, follows fast cars |
+| **Confirmation** | 3 detections and 75px of travel | Cars cross the frame, foliage and noise stay in place |
 | **Closest moment** | Max bounding-box area | Larger box = closer to camera (perspective geometry) |
 
 ### Data Flow Per Frame
@@ -78,17 +79,19 @@ Video Frame
 6. **Global change check**: if more than half the frame is foreground, no detection this frame (tracks just age)
 7. **Morphology**: OPEN removes noise, DILATE merges fragments, ERODE shrinks back to natural size
 8. **Contours**: `findContours(RETR_EXTERNAL)` extracts outer boundaries
-9. **Filtering**: Reject contours with area < 6000px², width < 40px, height < 130px, or aspect ratio outside [0.3, 4.0]
-10. **Merging**: Iteratively merge boxes within 100px of each other, then map boxes back to the video's real size
-11. **Tracking**: Every (detection, car) pair closer than 350px (to the car's predicted *or* last position) is ranked by distance; the closest pairs are matched first. Unmatched detections start new tracks
+9. **Filtering**: Reject contours with area < 6000px², width < 40px, height < 95px, or aspect ratio outside [0.3, 4.0]
+10. **Merging**: Iteratively merge boxes closer than 200px horizontally and 100px vertically, then map boxes back to the video's real size
+11. **Tracking**: Every (detection, track) pair closer than 350px (to the track's predicted *or* last position) is ranked: confirmed cars first, then by distance; the best pairs are matched first. Unmatched detections start new candidate tracks
 12. **Output**: Draw boxes + IDs on frame, update per-car statistics, write to video file
 
 ### Tracking details
 
-- **Prediction**: each track keeps a smoothed velocity (`VELOCITY_SMOOTHING = 0.5`). Its expected position is `last position + velocity × frames since last seen`.
-- **Predicted or last position**: the distance used for matching is the smaller of the two. The prediction helps fast cars; the last position keeps working when the velocity estimate is wrong, for example when a car leaves the frame and its box shrinks. On `cars.mp4`, using only the prediction split the first car and the trailer it tows into two IDs.
-- **Confirmation**: a track becomes a car after `MIN_HITS = 3` detections (cumulative, not necessarily consecutive). Only then does it get a public ID, so IDs are 1, 2, 3… with no gaps caused by one-frame noise.
-- **Grace period**: a track not seen for more than `MAX_UNSEEN = 8` frames is dropped.
+- **Tracked point**: the bottom-centre of the box (where the car touches the road). The wheels and shadow are always detected, while the top of a dark car against dark trees comes and goes; the box centre would jump up and down by 60+ px, the bottom does not move.
+- **Prediction**: each track keeps a smoothed velocity (`VELOCITY_SMOOTHING = 0.5`). Its expected position is `last position + velocity × frames since last seen`. The velocity is not updated when the box touches the frame edge, because a box cut by the edge has a shifted centre.
+- **Predicted or last position**: the distance used for matching is the smaller of the two. The prediction helps fast cars; the last position keeps working when the velocity estimate is off.
+- **Confirmed cars first**: when a confirmed car and a candidate both compete for a detection, the confirmed car wins. Without this, a fragment of car 1 (its trailer) was handed to a candidate, which then became a sixth car.
+- **Confirmation**: a track becomes a car after `MIN_HITS = 3` detections (cumulative, not necessarily consecutive) **and** once it has travelled `MIN_MOVE = 75` px. Foliage moving in the wind is detected repeatedly but stays in place, so it never gets an ID. Only then does a track get a public ID, so IDs are 1, 2, 3… with no gaps.
+- **Grace period**: a track not seen for more than `MAX_UNSEEN_SEC = 0.4` s (12 frames at 30 fps) is dropped, and immediately once its predicted position is outside the frame. Without that second rule, a car leaving on the left was confused with the next car entering on the left.
 
 ---
 
@@ -103,9 +106,11 @@ Video Frame
 | **MOG2 over MOG/KNN** | MOG2 is the most robust built-in background subtractor; handles multi-modal backgrounds |
 | **Shadow detection ON** | Shadows cause false detections; MOG2 marks them as gray so we can threshold them out |
 | **Global change guard (50 %)** | The largest car on the test video covers about 15 % of the frame, so 50 % only triggers on lighting changes and camera jolts |
-| **Aggressive MERGE_GAP (100px)** | A single car can produce multiple contours; merging prevents duplicate IDs |
+| **MERGE_GAP 200px across, 100px up/down** | A single vehicle can produce several contours along its length (car 1 and its trailer are ~150px apart); lanes are stacked vertically, so the vertical gap stays smaller |
+| **MIN_BOX_H = 95px** (was 130) | The dark car in the far lane is only 100–127px tall in the mask; at 130px it was rejected for its first second on screen |
+| **MIN_MOVE = 75px** | Makes the lower height filter safe: noise that passes the size filter doesn't travel |
 | **MIN_HITS = 3** | A track needs 3 detections before it is drawn — eliminates single-frame false positives |
-| **MAX_UNSEEN = 8** | Grace period of ~0.27s at 30fps — keeps IDs stable during brief detection gaps without causing ID reuse by different cars |
+| **MAX_UNSEEN_SEC = 0.4** | Rides over the 9-frame gap where car 3 disappears at 480p, without merging two cars thanks to the leave-the-frame rule |
 | **MAX_DISTANCE = 350** | Cars on a 1920px-wide video can move fast; a generous threshold prevents the same car from getting a new ID |
 | **Closest = largest bbox** | Simple proxy for "closest to camera" based on perspective: objects appear larger when closer |
 
@@ -127,7 +132,7 @@ Accuracy was evaluated through **manual visual inspection** of the test video (`
 
 | Metric | Value |
 |---|---|
-| Real vehicles observed | 5 (the first one tows a trailer) |
+| Real vehicles observed | 5 (the first one tows a trailer), confirmed by the author |
 | IDs assigned | 5 |
 | Correct detections | 5/5 (100%) |
 | False positives | 0 |
@@ -146,10 +151,28 @@ The test video was altered to check how the system behaves outside its tuning co
 | Upscaled to 4K (first 260 frames, 4 cars) | — | 4 |
 | Light flashes (4 frames, +90 brightness) | 6 (one false car) | 5 (4 frames skipped) |
 | Camera jolt (25 px, 4 frames) | 5 | 5 |
+| Same, with OpenCV 4.13 instead of 5.1 | — | 5 |
+
+### Car 3: detected late
+
+Car 3 is a dark gray sedan in the far lane, in front of dark trees. With the original settings it was on screen from about 4.6 s but only tracked from 5.87 s to 5.97 s: its mask is 100–127 px tall (only the wheels and lower body stand out), below the 130 px height filter, and it passed the filter in just a handful of frames.
+
+Fix: lower the height filter to 95 px, and make that safe by requiring a track to travel 75 px before it is confirmed. Fixing it uncovered three tracker weaknesses that were corrected too (trailer stolen by a candidate, centre jumping with the box height, car leaving vs car entering on the same side). Car 3 is now tracked from 4.63 s to 6.17 s, with 5 cars on every test video.
+
+### Parameter margins
+
+Each new parameter was varied around its value on the 1080p, 720p and 480p videos; every value in the range below gave exactly 5 cars:
+
+| Parameter | Value | Range that works |
+|---|---|---|
+| `MIN_BOX_H` | 95 | 90 – 100 |
+| `MIN_MOVE` | 75 | 40 – 90 |
+| `MERGE_GAP_X` | 200 | 150 – 250 |
+| `MAX_UNSEEN_SEC` | 0.4 | 0.3 – 0.5 |
 
 ### Automated tests
 
-`tests/test_app.py` (standard `unittest`, run with `python -m unittest -v`) covers box merging, the working scale, the tracker (confirmation, grace period, no ID gaps, order independence, motion prediction), the JSON report, and end-to-end runs on generated videos (two cars in opposite directions, a light flash, an unreadable file, CLI errors).
+`tests/test_app.py` (standard `unittest`, 26 tests, run with `python -m unittest -v`) covers box merging, the working scale, the tracker (confirmation, travel requirement, bottom-centre point, confirmed-first matching, leaving the frame, clipped boxes, grace period, no ID gaps, order independence, motion prediction), the JSON report, and end-to-end runs on generated videos (two cars in opposite directions, a light flash, an unreadable file, CLI errors). Each tracker rule was checked by removing it from a copy of the code: its test then fails.
 
 ### Caveats
 
@@ -180,18 +203,19 @@ The test video was altered to check how the system behaves outside its tuning co
 |---|---|
 | **Stationary camera only** | Background subtraction requires a fixed camera; continuous camera movement breaks detection (short jolts are skipped) |
 | **Cannot detect stopped cars** | A parked car becomes part of the "background" after MOG2's history window |
-| **Small/distant cars missed** | The height filter (h < 130px at 1080p) rejects small objects — necessary to avoid false positives but limits range |
-| **Low-contrast cars** | A dark car in front of dark trees is only partly detected, so its box can cover only part of the car |
+| **Small/distant cars missed** | The height filter (h < 95px at 1080p) rejects small objects — necessary to avoid false positives but limits range |
+| **Low-contrast cars** | A dark car in front of dark trees is tracked, but only partly detected: its box covers part of the car and can blink for a frame or two |
+| **Close cars in one lane merge** | Two cars less than 200px apart horizontally end up in one box |
 | **No occlusion handling** | When cars overlap, they may merge into a single detection or swap IDs |
 | **Scene-dependent** | Resolution no longer matters, but distance, angle, night or rain would still require re-tuning |
-| **No re-identification** | Once a car's ID is lost for more than 8 frames, it gets a new ID |
+| **No re-identification** | Once a car's ID is lost for more than 0.4 s, it gets a new ID |
 | **"Closest" is a proxy** | The largest box can include the shadow, or two merged cars; on a side view where all cars are at a similar distance, it mostly picks the frame where the box is largest |
 
 ---
 
 ## 5. Next Steps
 
-Done since the first version: motion prediction, order-independent matching, resolution independence, global change guard, CLI, automated tests.
+Done since the first version: motion prediction, order-independent and confirmed-first matching, bottom-centre tracking, travel requirement, resolution independence, global change guard, CLI, automated tests.
 
 ### Priority 1: Kalman filter (~30 min)
 

@@ -42,17 +42,23 @@ KERNEL_BIG = 15            # dilate/erode: merges fragments of the same car
 
 MIN_CONTOUR_AREA = 6000    # px²
 MIN_BOX_W = 40             # px
-MIN_BOX_H = 130            # px
+MIN_BOX_H = 95             # px (cars in the far lane are only ~100 px tall;
+                           # parked noise is rejected by MIN_MOVE instead)
 MIN_ASPECT, MAX_ASPECT = 0.3, 4.0
-MERGE_GAP = 100            # merge boxes closer than this (px)
+MERGE_GAP_X = 200          # merge boxes closer than this horizontally (px):
+                           # one vehicle (or a car and its trailer) is long
+MERGE_GAP_Y = 100          # ... and vertically (px)
 
 # If more than this share of the frame is "moving", it's a global change
 # (lighting flash, camera shake, MOG2 warm-up), not cars: skip detection.
 MAX_FOREGROUND_RATIO = 0.5
 
-MAX_DISTANCE = 350         # max centroid jump between frames (px at 1080p)
-MAX_UNSEEN = 8             # frames a lost car is kept in memory
+MAX_DISTANCE = 350         # max centroid jump between frames (px)
+MAX_UNSEEN_SEC = 0.4       # how long a lost car is kept in memory (seconds)
+MAX_UNSEEN = 12            # same, in frames, at 30 fps (default for the tracker)
 MIN_HITS = 3               # detections needed before a car is confirmed
+MIN_MOVE = 75              # px a track must travel before it is confirmed:
+                           # cars cross the frame, foliage and noise stay put
 VELOCITY_SMOOTHING = 0.5   # 0 = ignore motion, 1 = trust last displacement only
 
 FALLBACK_FPS = 30.0
@@ -64,8 +70,11 @@ def working_scale(width: int, height: int) -> float:
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
-def merge_boxes(boxes: list[list[int]], gap: float) -> list[list[int]]:
-    """Merge boxes [x1, y1, x2, y2] that overlap or are closer than `gap`."""
+def merge_boxes(boxes: list[list[int]], gap_x: float,
+                gap_y: float | None = None) -> list[list[int]]:
+    """Merge boxes [x1, y1, x2, y2] that overlap or are closer than
+    `gap_x` horizontally and `gap_y` vertically (default: same as gap_x)."""
+    gap_y = gap_x if gap_y is None else gap_y
     boxes = [list(b) for b in boxes]
     merged = True
     while merged:
@@ -73,8 +82,8 @@ def merge_boxes(boxes: list[list[int]], gap: float) -> list[list[int]]:
         result: list[list[int]] = []
         for box in boxes:
             for i, other in enumerate(result):
-                if (box[0] <= other[2] + gap and box[2] >= other[0] - gap and
-                        box[1] <= other[3] + gap and box[3] >= other[1] - gap):
+                if (box[0] <= other[2] + gap_x and box[2] >= other[0] - gap_x and
+                        box[1] <= other[3] + gap_y and box[3] >= other[1] - gap_y):
                     result[i] = [min(box[0], other[0]), min(box[1], other[1]),
                                  max(box[2], other[2]), max(box[3], other[3])]
                     merged = True
@@ -136,7 +145,7 @@ class Detector:
 
         s = self.scale
         result = []
-        for x1, y1, x2, y2 in merge_boxes(boxes, MERGE_GAP):
+        for x1, y1, x2, y2 in merge_boxes(boxes, MERGE_GAP_X, MERGE_GAP_Y):
             x1, y1 = round(x1 / s), round(y1 / s)
             x2, y2 = min(self.width, round(x2 / s)), min(self.height, round(y2 / s))
             result.append((x1, y1, x2 - x1, y2 - y1))
@@ -148,6 +157,8 @@ class Detector:
 class Track:
     cx: float
     cy: float
+    x0: float = 0.0             # where the track started
+    y0: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
     hits: int = 1
@@ -166,22 +177,50 @@ class CentroidTracker:
       (predicted or last seen position, whichever is closer), and the
       closest pairs are matched first, so the result doesn't depend on the
       order of detections.
+    - Confirmed cars are served before candidate tracks, so a fragment of a
+      known car (e.g. the trailer it tows) is not stolen by a candidate.
     - A track becomes a car (and gets a public ID) after `min_hits`
-      detections, so public IDs are 1, 2, 3... with no gaps from flicker.
+      detections *and* once it has travelled `min_move` px: foliage and
+      noise flicker in place, cars cross the frame. Public IDs are 1, 2, 3...
+      with no gaps.
+    - A lost track is forgotten after `max_unseen` frames, or as soon as its
+      predicted position leaves the frame (the car is gone), so a car leaving
+      on one side can't be confused with the next one entering there.
     """
 
     def __init__(self, max_distance: float, max_unseen: int = MAX_UNSEEN,
-                 min_hits: int = MIN_HITS):
+                 min_hits: int = MIN_HITS, min_move: float = MIN_MOVE,
+                 frame_size: tuple[int, int] | None = None):
         self.max_distance = max_distance
         self.max_unseen = max_unseen
         self.min_hits = min_hits
+        self.min_move = min_move
+        self.frame_size = frame_size
         self.tracks: dict[int, Track] = {}
         self._next_track = 1
         self._next_car = 1
 
+    def _touches_border(self, box) -> bool:
+        if self.frame_size is None:
+            return False
+        x, y, w, h = box
+        fw, fh = self.frame_size
+        return x <= 1 or y <= 1 or x + w >= fw - 1 or y + h >= fh - 1
+
+    def _left_frame(self, t: Track) -> bool:
+        if self.frame_size is None:
+            return False
+        px, py = t.predicted()
+        w, h = self.frame_size
+        return not (0 <= px <= w and 0 <= py <= h)
+
     def update(self, boxes):
         """Returns [(car_id, (x, y, w, h)), ...] for confirmed cars seen now."""
-        centers = [(x + w / 2, y + h / 2) for x, y, w, h in boxes]
+        # Track the bottom-centre of each box (where the car touches the
+        # road): the wheels and shadow are always detected, while the top of
+        # a dark car against dark trees comes and goes, which makes the box
+        # centre jump up and down
+        centers = [(x + w / 2, y + h) for x, y, w, h in boxes]
 
         pairs = []
         for d, (cx, cy) in enumerate(centers):
@@ -193,12 +232,13 @@ class CentroidTracker:
                 dist = min(math.hypot(cx - px, cy - py),
                            math.hypot(cx - t.cx, cy - t.cy))
                 if dist < self.max_distance:
-                    pairs.append((dist, d, tid))
+                    # confirmed cars first (False < True), then by distance
+                    pairs.append((t.car_id is None, dist, d, tid))
         pairs.sort()
 
         matched_det: dict[int, int] = {}
         used_tracks: set[int] = set()
-        for _, d, tid in pairs:
+        for _, _, d, tid in pairs:
             if d in matched_det or tid in used_tracks:
                 continue
             matched_det[d] = tid
@@ -210,30 +250,35 @@ class CentroidTracker:
             if tid is None:
                 tid = self._next_track
                 self._next_track += 1
-                t = self.tracks[tid] = Track(cx, cy)
+                t = self.tracks[tid] = Track(cx, cy, x0=cx, y0=cy)
                 used_tracks.add(tid)
             else:
                 t = self.tracks[tid]
-                steps = t.unseen + 1
-                a = VELOCITY_SMOOTHING
-                t.vx = (1 - a) * t.vx + a * (cx - t.cx) / steps
-                t.vy = (1 - a) * t.vy + a * (cy - t.cy) / steps
+                # A box cut by the frame edge has a shifted centre: keep the
+                # previous velocity instead of learning a wrong one
+                if not self._touches_border(boxes[d]):
+                    steps = t.unseen + 1
+                    a = VELOCITY_SMOOTHING
+                    t.vx = (1 - a) * t.vx + a * (cx - t.cx) / steps
+                    t.vy = (1 - a) * t.vy + a * (cy - t.cy) / steps
                 t.cx, t.cy = cx, cy
                 t.hits += 1
                 t.unseen = 0
-            if t.hits >= self.min_hits:
-                if t.car_id is None:
-                    t.car_id = self._next_car
-                    self._next_car += 1
+            if t.car_id is None and t.hits >= self.min_hits and \
+                    math.hypot(t.cx - t.x0, t.cy - t.y0) >= self.min_move:
+                t.car_id = self._next_car
+                self._next_car += 1
+            if t.car_id is not None:
                 confirmed.append((t.car_id, boxes[d]))
 
-        # Tracks not seen this frame age, and are dropped after max_unseen
+        # Tracks not seen this frame age; they are dropped after max_unseen
+        # frames or once their predicted position is out of the frame
         for tid in list(self.tracks):
             if tid in used_tracks:
                 continue
             t = self.tracks[tid]
             t.unseen += 1
-            if t.unseen > self.max_unseen:
+            if t.unseen > self.max_unseen or self._left_frame(t):
                 del self.tracks[tid]
         return confirmed
 
@@ -336,7 +381,12 @@ def process_video(input_path: Path, output_path: Path | None, json_path: Path | 
             raise RuntimeError(f"Cannot create output video: {output_path}")
 
     detector = Detector(width, height)
-    tracker = CentroidTracker(MAX_DISTANCE / detector.scale)
+    tracker = CentroidTracker(
+        max_distance=MAX_DISTANCE / detector.scale,
+        max_unseen=max(1, round(MAX_UNSEEN_SEC * fps)),
+        min_hits=MIN_HITS,
+        min_move=MIN_MOVE / detector.scale,
+        frame_size=(width, height))
     stats: dict[int, CarStats] = {}
     frame_delay = 1.0 / fps
     proc_fps = 0.0

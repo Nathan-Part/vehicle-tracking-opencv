@@ -11,7 +11,7 @@ Background subtraction, morphology and a centroid tracker give each car a stable
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?logo=python&logoColor=white)
 ![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B%20%7C%205-5c3ee8?logo=opencv&logoColor=white)
 ![No ML](https://img.shields.io/badge/Deep_learning-none-f97316)
-![Tests](https://img.shields.io/badge/Tests-19_passing-22c55e)
+![Tests](https://img.shields.io/badge/Tests-26_passing-22c55e)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
 
 </div>
@@ -24,19 +24,22 @@ Background subtraction, morphology and a centroid tracker give each car a stable
 
 <p align="center">
   <img src="docs/screenshots/car-2-closest.jpg" alt="Car 2, a white van, at its closest moment" width="32%" />
+  <img src="docs/screenshots/car-3-far-lane.jpg" alt="Car 3, a dark car in the far lane, tracked as it enters" width="32%" />
   <img src="docs/screenshots/car-4-closest.jpg" alt="Car 4, in the near lane, at its closest moment" width="32%" />
-  <img src="docs/screenshots/car-5-closest.jpg" alt="Car 5 at its closest moment" width="32%" />
 </p>
 
 On the sample video (`cars.mp4`, 1920×1080, 30 fps, 607 frames), the script finds **5 vehicles, 5 IDs, no false positive and no ID switch**:
 
 | ID | Seen | Direction | Closest moment | Bounding box (x, y, w, h) |
 | --: | --- | --- | --: | --- |
-| 1 | 0.2 s → 1.7 s | ← left | 0.97 s | (370, 373, 400, 232) |
+| 1 | 0.3 s → 1.8 s | ← left | 1.37 s | (0, 367, 590, 236) ¹ |
 | 2 | 3.2 s → 4.8 s | ← left | 4.27 s | (171, 355, 534, 224) |
-| 3 | 5.9 s → 6.0 s | ← left | 5.87 s | (76, 396, 385, 133) |
-| 4 | 6.6 s → 8.0 s | → right | 7.07 s | (19, 398, 912, 347) |
-| 5 | 14.6 s → 16.4 s | ← left | 16.00 s | (23, 405, 531, 194) |
+| 3 | 4.6 s → 6.2 s | ← left | 5.63 s | (330, 402, 420, 127) ² |
+| 4 | 6.7 s → 8.1 s | → right | 7.07 s | (19, 398, 912, 347) |
+| 5 | 14.6 s → 16.5 s | ← left | 16.00 s | (23, 405, 531, 194) |
+
+¹ Car 1 tows a trailer: both are counted as one vehicle, and the box includes the trailer.
+² Car 3 is a dark car in the far lane, in front of dark trees: it is tracked over its whole crossing, but only part of it stands out from the background, so its box is smaller than the car.
 
 The matching JSON output is in [`docs/sample-results.json`](docs/sample-results.json) (OpenCV 5.1; other OpenCV versions can shift a frame or two).
 
@@ -46,9 +49,9 @@ The same video, altered to leave the tuning conditions. Expected: 5 cars.
 
 | Variant | 720p | 480p | 4K | Light flashes | Camera jolt |
 | --- | :-: | :-: | :-: | :-: | :-: |
-| Cars found | 5 | 5 | 4 / 4 ¹ | 5 | 5 |
+| Cars found | 5 | 5 | 4 / 4 ³ | 5 | 5 |
 
-¹ First 260 frames only, which contain 4 cars.
+³ First 260 frames only, which contain 4 cars. Results are also identical with OpenCV 4.13 and 5.1.
 
 ## Features
 
@@ -57,8 +60,10 @@ The same video, altered to leave the tuning conditions. Expected: 5 cars.
 - **Flash and jolt guard**: when more than half of the frame changes at once (lighting, camera shake), the frame is skipped instead of producing fake cars.
 - **Any resolution**: detection runs on a copy resized to 1080p, so the tuned values work the same from 480p to 4K, and boxes are drawn at the real size.
 - **Mask cleanup**: a morphological opening removes noise, then dilation and erosion stitch the fragments of one car back into a single blob.
-- **Box filtering and merging**: contours are filtered by area, size and aspect ratio, then nearby boxes are merged so one car gives one box.
-- **Stable IDs**: global nearest-first matching (independent of detection order), motion prediction for fast cars, a 3-hit confirmation against flicker, and an 8-frame grace period. IDs are numbered 1, 2, 3… with no gaps.
+- **Box filtering and merging**: contours are filtered by area, size and aspect ratio, then nearby boxes are merged (up to 200 px apart horizontally, 100 px vertically) so one vehicle, even with a trailer, gives one box.
+- **Stable IDs**: global nearest-first matching (independent of detection order) with confirmed cars served first, motion prediction for fast cars, and a 0.4 s grace period. IDs are numbered 1, 2, 3… with no gaps.
+- **Only things that travel become cars**: a track is confirmed after 3 detections *and* 75 px of travel, so foliage moving in the wind never gets an ID, which lets the size filter accept small cars in the far lane.
+- **Ground-contact tracking**: each car is followed by the bottom-centre of its box (wheels and shadow), which stays put when the top of a dark car blends into the background.
 - **Per-car report**: closest moment (largest box), first and last time seen, and direction of travel.
 - **Outputs**: an annotated video, a JSON report and a summary table in the terminal.
 - **Live preview** at the video's real speed, in two windows: the annotated video and the cleaned mask. `q`, `Esc` or closing the window stops it, and `Ctrl+C` still saves what was processed.
@@ -71,7 +76,7 @@ Each frame goes through a linear pipeline:
 ```text
 Frame ─► Resize to 1080p ─► Gaussian blur ─► MOG2 ─► Threshold (drop shadows)
       ─► Global change? (skip) ─► Open / Dilate / Erode ─► Contours + filters
-      ─► Merge nearby boxes ─► Centroid tracking (IDs) ─► Closest moment ─► Video + JSON
+      ─► Merge nearby boxes ─► Tracking (IDs, must travel) ─► Closest moment ─► Video + JSON
 ```
 
 | Step | Technique | Why |
@@ -81,9 +86,10 @@ Frame ─► Resize to 1080p ─► Gaussian blur ─► MOG2 ─► Threshold (
 | Detect motion | MOG2 (`history=700`, `varThreshold=120`) | Robust built-in subtractor with shadow detection |
 | Ignore global changes | Skip if > 50 % of the frame is foreground | A flash or a jolt is not a car |
 | Clean the mask | Threshold at 200, then open / dilate / erode | Removes shadows and specks, joins car fragments |
-| Keep cars only | Area ≥ 6000 px², `w ≥ 40`, `h ≥ 130`, aspect 0.3 to 4 | Rejects small or oddly shaped blobs |
-| One car, one box | Iterative merge of boxes closer than 100 px | A car can be split into several contours |
-| Track | Closest pairs first, to the predicted or last position, within 350 px | Order-independent, follows fast cars |
+| Keep car-sized blobs | Area ≥ 6000 px², `w ≥ 40`, `h ≥ 95`, aspect 0.3 to 4 | Rejects small or oddly shaped blobs |
+| One vehicle, one box | Merge boxes closer than 200 px horizontally / 100 px vertically | A car (or car + trailer) can be split into several contours |
+| Track | Bottom-centre point, confirmed cars first, closest pairs first, predicted or last position, within 350 px | Stable, order-independent, follows fast cars |
+| Confirm | 3 detections and 75 px travelled | Cars cross the frame; foliage stays put |
 | Closest moment | Largest bounding-box area per ID | Things look bigger when they are closer |
 
 All tuning values are constants at the top of [`app.py`](app.py). The full write-up (design choices, accuracy, robustness tests, strengths, weaknesses and next steps) is in [`DOCUMENTATION.md`](DOCUMENTATION.md).
@@ -95,7 +101,7 @@ All tuning values are constants at the top of [`app.py`](app.py). The full write
 | Language | Python 3.10+ (tested with Python 3.14) |
 | Computer vision | OpenCV (`opencv-python`, tested with 4.13 and 5.1) |
 | Standard library | `argparse`, `dataclasses`, `pathlib`, `json`, `math`, `time` |
-| Tests | `unittest` (standard library), 19 tests including end-to-end runs on generated videos |
+| Tests | `unittest` (standard library), 26 tests including end-to-end runs on generated videos |
 | Video codec | MPEG-4 (`mp4v`) through `cv2.VideoWriter` |
 
 ## Getting started
@@ -152,7 +158,7 @@ python -m unittest -v
 
 ### Use your own video
 
-The camera must be **fixed**. The resolution doesn't matter, but the size filters assume cars fill roughly the same share of the frame as in the sample video. For a camera much farther away or at another angle, adjust `MIN_CONTOUR_AREA`, `MIN_BOX_W` / `MIN_BOX_H`, `MERGE_GAP` and `MAX_DISTANCE` at the top of `app.py`.
+The camera must be **fixed**. The resolution doesn't matter, but the size filters assume cars fill roughly the same share of the frame as in the sample video. For a camera much farther away or at another angle, adjust `MIN_CONTOUR_AREA`, `MIN_BOX_W` / `MIN_BOX_H`, `MERGE_GAP_X` / `MERGE_GAP_Y`, `MIN_MOVE` and `MAX_DISTANCE` at the top of `app.py`.
 
 ## Output
 
@@ -180,9 +186,9 @@ Both files are regenerated on every run, so they are not versioned.
 
 - **Fixed camera only**: short jolts are skipped, but a moving camera sees motion everywhere.
 - **Stopped cars disappear**: MOG2 absorbs a stationary car into the background after a while.
-- **Low contrast**: a dark car in front of dark trees is only partly detected, so its box can be too small.
-- **Close cars can merge**: the 100 px merge gap can join two cars driving close together into one box.
-- **No re-identification**: a car lost for more than 8 frames gets a new ID.
+- **Low contrast**: a dark car in front of dark trees is still tracked, but only partly detected, so its box can be too small and can blink for a frame or two.
+- **Close cars can merge**: two cars less than 200 px apart in the same lane end up in one box.
+- **No re-identification**: a car lost for more than 0.4 s gets a new ID.
 
 ## Project structure
 
@@ -197,7 +203,7 @@ Both files are regenerated on every run, so they are not versioned.
 ├── docs/
 │   ├── demo.gif           # Animated preview used in this README
 │   ├── sample-results.json
-│   └── screenshots/       # Closest moments of cars 2, 4 and 5
+│   └── screenshots/       # Cars 2, 3 and 4
 └── LICENSE
 ```
 
