@@ -66,7 +66,7 @@ The same video, altered to leave the tuning conditions. Expected: 5 cars.
 - **Ground-contact tracking**: each car is followed by the bottom-centre of its box (wheels and shadow), which stays put when the top of a dark car blends into the background.
 - **Per-car report**: closest moment (largest box), first and last time seen, and direction of travel.
 - **Outputs**: an annotated video, a JSON report and a summary table in the terminal.
-- **Live preview** at the video's real speed, in two windows: the annotated video and the cleaned mask. `q`, `Esc` or closing the window stops it, and `Ctrl+C` still saves what was processed.
+- **Live preview** at the video's real speed, in two windows: the annotated video and the cleaned mask. `q` or `Esc` stops it, and `Ctrl+C` still saves what was processed.
 - **Command line**: choose the input and outputs, or run headless at full speed.
 
 ## How it works

@@ -339,12 +339,9 @@ def draw_hud(frame, frame_index: int, total: int, cars: int, proc_fps: float) ->
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
-def _window_closed(name: str) -> bool:
-    try:
-        return cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1
-    except cv2.error:
-        return True
-
+# Note: no "window closed?" check. On Windows, getWindowProperty(...,
+# WND_PROP_VISIBLE) returns 0 after a few seconds for a 1080p window even
+# though it is still open, which stopped playback on its own.
 
 def process_video(input_path: Path, output_path: Path | None, json_path: Path | None,
                   display: bool = True, verbose: bool = True) -> list[dict]:
@@ -434,7 +431,7 @@ def process_video(input_path: Path, output_path: Path | None, json_path: Path | 
                     # Play at the video's real speed, minus processing time
                     wait_ms = max(1, int((frame_delay - elapsed) * 1000))
                     key = cv2.waitKey(wait_ms) & 0xFF
-                    if key in (ord("q"), 27) or _window_closed("Video"):
+                    if key in (ord("q"), 27):
                         log("Playback stopped by user.")
                         break
 
